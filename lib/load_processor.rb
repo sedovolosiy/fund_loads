@@ -15,27 +15,35 @@ class LoadProcessor
   end
 
   # Processes a JSON line and returns a hash: { "id", "customer_id", "accepted" }
+  # On any parsing or data error, returns accepted: false (without raising)
   def process_line(line)
-    attempt = JSON.parse(line)
-    load_id = attempt["id"].to_s
-    cid     = attempt["customer_id"].to_s
+    result = { "id" => nil, "customer_id" => nil, "accepted" => false }
+
+    begin
+      attempt = JSON.parse(line)
+      load_id = attempt.fetch("id").to_s
+      cid     = attempt.fetch("customer_id").to_s
+      amount_cents = parse_amount(attempt.fetch("load_amount"))
+      time         = DateTime.parse(attempt.fetch("time"))
+    rescue JSON::ParserError, ArgumentError, TypeError, KeyError
+      # Invalid JSON, missing keys, or bad formats => reject
+      return result
+    end
+
+    result["id"] = load_id
+    result["customer_id"] = cid
 
     # Return previous result for duplicate IDs
     if @seen_ids.key?(load_id)
       return @seen_ids[load_id]
     end
 
-    amount_cents = (attempt["load_amount"].delete("$ ").to_f * 100).to_i
-    time         = DateTime.parse(attempt["time"])
-    date         = time.to_date
-    week_key     = [date.cwyear, date.cweek]
-    is_monday    = time.monday?
-    is_prime_id  = load_id.match?(/^\d+$/) && Prime.prime?(load_id.to_i)
+    date       = time.to_date
+    week_key   = [date.cwyear, date.cweek]
+    is_monday  = time.monday?
+    is_prime   = load_id.match?(/^\d+$/) && Prime.prime?(load_id.to_i)
+    monday_tag = is_monday && (is_prime || load_id.start_with?("mon_"))
 
-    # Monday loads count double toward limits for prime-ID or IDs starting with "mon_"
-    monday_tag = is_monday && (is_prime_id || load_id.start_with?("mon_"))
-
-    # Amounts counted toward limits
     daily_amount  = monday_tag ? amount_cents * 2 : amount_cents
     weekly_amount = monday_tag ? amount_cents * 2 : amount_cents
 
@@ -44,36 +52,41 @@ class LoadProcessor
     week_sum  = cust[:weekly].fetch(week_key, 0)
     prime_done = @global_prime_done[date]
 
-    result = { "id" => load_id, "customer_id" => cid, "accepted" => false }
-
-    if is_prime_id
-      # Prime-ID rule: only one per day, max effective weekly amount ≤ PRIME_ID_LIMIT_CENTS
+    # Prime-ID logic
+    if is_prime
       if !prime_done && weekly_amount <= PRIME_ID_LIMIT_CENTS
-        result["accepted"] = true
+        accept_load(cust, date, week_key, day_state, daily_amount, weekly_amount)
         @global_prime_done[date] = true
-
-        # Record counts
-        day_state[:sum]   += daily_amount
-        day_state[:count] += 1
-        cust[:daily][date]      = day_state
-        cust[:weekly][week_key] = week_sum + weekly_amount
-      end
-
-    else
-      # Regular loads: apply daily count, daily sum, and weekly sum limits
-      if day_state[:count] + 1 <= MAX_DAILY_COUNT &&
-         day_state[:sum] + daily_amount <= DAILY_LIMIT_CENTS &&
-         week_sum + weekly_amount <= WEEKLY_LIMIT_CENTS
-
         result["accepted"] = true
-        day_state[:sum]   += daily_amount
-        day_state[:count] += 1
-        cust[:daily][date]      = day_state
-        cust[:weekly][week_key] = week_sum + weekly_amount
+      end
+    else
+      # Regular load logic
+      if can_accept_regular?(day_state, daily_amount, week_sum, weekly_amount)
+        accept_load(cust, date, week_key, day_state, daily_amount, weekly_amount)
+        result["accepted"] = true
       end
     end
 
     @seen_ids[load_id] = result
     result
+  end
+
+  private
+
+  def parse_amount(amount_str)
+    (amount_str.delete('$ ').to_f * 100).to_i
+  end
+
+  def can_accept_regular?(day_state, daily_amount, week_sum, weekly_amount)
+    day_state[:count] + 1 <= MAX_DAILY_COUNT &&
+      day_state[:sum] + daily_amount <= DAILY_LIMIT_CENTS &&
+      week_sum + weekly_amount <= WEEKLY_LIMIT_CENTS
+  end
+
+  def accept_load(cust, date, week_key, day_state, daily_amount, weekly_amount)
+    day_state[:sum]   += daily_amount
+    day_state[:count] += 1
+    cust[:daily][date]      = day_state
+    cust[:weekly][week_key] = cust[:weekly].fetch(week_key, 0) + weekly_amount
   end
 end
